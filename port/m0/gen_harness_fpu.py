@@ -102,7 +102,7 @@ int main(int argc, char **argv)
 		for (int i = 0; i < t->in.nmem; i++) put_mem(&t->in.mem[i]);
 		sh4_set_host_fpmode(c.fpscr);
 		fn_ptr(t->fn)(&c);
-		_mm_setcsr(0x1f80);
+		sh4_set_host_fpmode(0);
 		char why[200] = "";
 		for (int i = 0; i < 16 && !why[0]; i++)
 			if (c.r[i] != t->out.r[i]) snprintf(why, sizeof(why), "r%d %08x != %08x", i, c.r[i], t->out.r[i]);

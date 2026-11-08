@@ -175,10 +175,12 @@ static inline void sh4_macw(SH4 *c, int n, int m)
 /* ---- FPU (semantics copied from Flycast core/hw/sh4/interpr/sh4_fpu.cpp) ----------------
  * c->fr is the current bank, c->xf the other one (Flycast swaps the arrays on FPSCR.FR change).
  * FPSCR bits: RM 0-1, DN 18, PR 19, SZ 20, FR 21. The host must compute with the matching
- * rounding/denormal mode: sh4_set_host_fpmode() mirrors Flycast's setHostRoundingMode (x64).
+ * rounding/denormal mode: see sh4_set_host_fpmode() for host-specific limitations.
  */
 #include <math.h>
+#if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
+#endif
 #define FPSCR_PR(c) (((c)->fpscr >> 19) & 1)
 #define FPSCR_SZ(c) (((c)->fpscr >> 20) & 1)
 #define FPSCR_FR(c) (((c)->fpscr >> 21) & 1)
@@ -208,12 +210,29 @@ static inline void setDR(SH4 *c, int n, double d)
 static inline u64 rd64(u32 a) { return (u64)rd32(a) | ((u64)rd32(a + 4) << 32); }
 static inline void wr64(u32 a, u64 v) { wr32(a, (u32)v); wr32(a + 4, (u32)(v >> 32)); }
 
+/* RM=0: nearest/even, RM=1: toward zero. Reserved RM=2/3 retain the
+ * historical nearest fallback. Guest DN (bit 18) means denormals-to-zero,
+ * NOT ARM's default-NaN bit. Keep FPCR.DN clear to propagate NaN payloads.
+ * AArch64 FZ flushes BOTH input and result denormals; x86 FTZ leaves DAZ
+ * clear (results only). FPCR alone cannot reproduce that x86 distinction,
+ * nor does this implement SH4 denormal exceptions or exact NaN semantics.
+ * Reset host controls/status rather than inheriting traps, alternate rounding,
+ * FZ16/AHP or optional extended FP modes from the caller. */
 static inline void sh4_set_host_fpmode(u32 fpscr)
 {
+#if defined(__aarch64__)
+	u64 m = 0;
+	if ((fpscr & 3) == 1) m |= 3ull << 22;	/* round to zero */
+	if ((fpscr >> 18) & 1) m |= 1ull << 24;	/* FZ, not default-NaN */
+	__asm__ volatile("msr fpcr, %0\n\tisb\n\tmsr fpsr, xzr" : : "r"(m) : "memory");
+#elif defined(__x86_64__) || defined(__i386__)
 	u32 m = 0x1f80;
 	if ((fpscr & 3) == 1) m |= 3 << 13;		/* round to zero */
 	if ((fpscr >> 18) & 1) m |= 1 << 15;	/* flush denormals to zero */
 	_mm_setcsr(m);
+#else
+#error "sh4_set_host_fpmode requires x86 SSE or AArch64"
+#endif
 }
 static inline void sh4_set_fpscr(SH4 *c, u32 v)
 {

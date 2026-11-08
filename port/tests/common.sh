@@ -8,8 +8,9 @@ case "$(uname -s)" in Linux) EXE="$HOME/m1_build/m1";; esac
 EXE="${M1_EXE:-$EXE}"
 OUT="$PORT/build/tests"
 mkdir -p "$OUT"
-# the scripted pad sequence: Start, A ... into an Arcade fight (Kilik)
-PADS="600:s,606:-,900:a,906:-,1200:s,1206:-,1500:a,1506:-,1800:s,1806:-,2100:a,2106:-,2400:s,2406:-,2700:a,2706:-"
+# Start confirms the main menu; A there does not. Then confirm the character with A.
+# Verified under QEMU AArch64: mode 1 reached, 329/329 fight SyncTest frames identical.
+PADS="600:s,606:-,900:s,906:-,1200:a,1206:-,1500:a,1506:-,1800:a,1806:-,2100:a,2106:-"
 # PPM -> PNG (Python, no extra modules)
 ppm2png() { python -I - "$1" "$2" <<'PY'
 import sys, struct, zlib

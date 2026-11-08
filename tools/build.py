@@ -30,6 +30,7 @@ import concurrent.futures
 import hashlib
 import io
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -44,7 +45,35 @@ CACHE = os.path.join(SC, 'toolchain')
 LOCAL = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
 OUT = os.path.join(LOCAL, 'sc-m1')          # objects and executables (outside the repository; --out moves them)
 LINUX = sys.platform.startswith('linux')
-ZIG_TARGET = 'x86_64-linux-gnu.2.28'       # runs on glibc 2.28 and newer (2018 on: Debian 10, Ubuntu 20.04, SteamOS 3)
+TARGETS = ('x86_64-linux-gnu.2.28', 'aarch64-linux-gnu.2.28')
+
+
+def native_target():
+    """Normalize common host architecture aliases."""
+    machine = platform.machine().lower()
+    arch = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(machine, machine)
+    if arch not in ('x86_64', 'aarch64'):
+        raise ValueError('unsupported host architecture: ' + machine)
+    return arch + '-linux-gnu.2.28'
+
+
+def zig_archive(machine=None):
+    """Pinned compiler archive for the HOST, not the compilation target."""
+    machine = (machine or platform.machine()).lower()
+    arch = {'amd64': 'x86_64', 'arm64': 'aarch64'}.get(machine, machine)
+    hashes = {  # Official https://ziglang.org/download/index.json, release 0.14.1
+        'x86_64': '24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c',
+        'aarch64': 'f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b',
+    }
+    if arch not in hashes:
+        raise ValueError('unsupported Zig host architecture: ' + machine)
+    folder = 'zig-%s-linux-0.14.1' % arch
+    return ('https://ziglang.org/download/0.14.1/' + folder + '.tar.xz', hashes[arch], folder)
+
+
+ZIG_TARGET = native_target() if LINUX else TARGETS[0]
+SYSROOT = None
+JOBS = min(os.cpu_count() or 4, 8)
 
 # pinned downloads: name -> (url, sha256, folder inside toolchain/ once unpacked). The SHA-256s are
 # the ones GitHub publishes for the release files, and for Flycast's two files those of its commit
@@ -59,8 +88,7 @@ PINNED = {
     'biosfont.bin.zip': ('https://raw.githubusercontent.com/flyinghead/flycast/%s/fonts/biosfont.bin.zip' % FLYCAST_COMMIT,
                          'e996bc0f9854fbe7ad057948c8cda6ff9ef9b4b6d0347c92f1ecad71a92214ce', 'flycast/fonts'),
     # Linux: the SHA-256 ziglang.org publishes in its download index
-    'zig': ('https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz',
-            '24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c', 'zig-x86_64-linux-0.14.1'),
+    'zig': zig_archive() if LINUX else None,
 }
 
 GAME_SOURCES = ['m1', 'hw', 'hle', 'threads', 'maple', 'ta', 'tex', 'render', 'state', 'netplay', 'aica', 'arm7',
@@ -176,7 +204,7 @@ def run(cmd, cwd=PORT):
 
 def parallel(jobs):
     """Runs the commands at once (one per core) and stops at the first failure."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as ex:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=JOBS) as ex:
         for f in [ex.submit(run, *j) for j in jobs]:
             f.result()
 
@@ -336,6 +364,58 @@ def step_host(llvm, sdl):
     say('  built Voldorium.exe (build %s) in %d s' % (bid, time.time() - t))
 
 
+def prepare_output(out, target, sysroot=None):
+    """Refuse mixed-architecture objects, including unsafe unmarked old caches."""
+    os.makedirs(out, exist_ok=True)
+    identity = target + ('\nsysroot=' + os.path.realpath(sysroot) if sysroot else '')
+    marker = os.path.join(out, '.build-target')
+    if os.path.exists(marker):
+        with open(marker, encoding='utf-8') as f:
+            previous = f.read().strip()
+        if previous != identity:
+            fail('--out was built for %s, not %s; choose a fresh --out directory' % (previous, target))
+    else:
+        # Legacy Linux objects were x86_64; only that target can safely adopt them.
+        if target != TARGETS[0] and any(os.path.exists(os.path.join(out, d)) for d in ('obj', 'ggpo', 'zig-cache', 'voldorium', 'sc_game.so')):
+            fail('unmarked --out may contain incompatible objects; choose a fresh --out directory')
+        with open(marker, 'w', encoding='utf-8') as f:
+            f.write(identity + '\n')
+
+
+def linux_dependency_flags(sysroot, target, out):
+    """Stage graphics headers only, keeping Zig's baseline libc headers.
+
+    Cross builds never query host sdl2-config or host include/library folders.
+    Recreate staging to avoid stale symlinks from a different sysroot.
+    """
+    multiarch = target.split('-gnu.')[0] + '-gnu'
+    root = os.path.abspath(sysroot) if sysroot else '/'
+    if sysroot and not os.path.isdir(root):
+        fail('--sysroot does not exist: ' + root)
+    inc = os.path.join(out, 'sysinc')
+    if os.path.isdir(inc):
+        shutil.rmtree(inc)
+    os.makedirs(inc, exist_ok=True)
+    for d in ('SDL2', 'GL', 'KHR'):
+        for prefix in ('usr/include', 'usr/include/' + multiarch):
+            src = os.path.join(root, prefix, d)
+            if os.path.isdir(src):
+                os.makedirs(os.path.join(inc, d), exist_ok=True)
+                for f in os.listdir(src):
+                    dest = os.path.join(inc, d, f)
+                    if os.path.lexists(dest):
+                        os.unlink(dest)
+                    os.symlink(os.path.join(src, f), dest)
+    cf = ['-I', inc, '-I', os.path.join(inc, 'SDL2'), '-D_REENTRANT']
+    if sysroot:
+        libdirs = [os.path.join(root, d) for d in (
+            'usr/lib/' + multiarch, 'lib/' + multiarch, 'usr/lib', 'lib')]
+        libdirs = [d for d in libdirs if os.path.isdir(d)]
+    else:
+        libdirs = [x[2:] for x in run(['sdl2-config', '--libs']).split() if x.startswith('-L')] or ['/usr/lib/' + multiarch]
+    return cf, ['-L' + d for d in libdirs]
+
+
 def step_host_linux(zig):
     """The Linux executable voldorium (and libggpo): the runtime, renderer, sound, netplay and lobby,
     with Zig at the glibc 2.28 baseline. SDL2 and OpenGL are the system's (headers and libraries
@@ -344,18 +424,7 @@ def step_host_linux(zig):
     obj = os.path.join(OUT, 'obj')
     os.makedirs(obj, exist_ok=True)
     gg = os.path.join(SC, 'third_party', 'ggpo', 'src')
-    # only the SDL2 and OpenGL headers from the system: its libc headers are newer than the baseline
-    inc = os.path.join(OUT, 'sysinc')
-    os.makedirs(inc, exist_ok=True)
-    for d in ('SDL2', 'GL', 'KHR'):   # each file, also from the multiarch folder (Debian, Ubuntu)
-        for src in (os.path.join('/usr/include', d), os.path.join('/usr/include/x86_64-linux-gnu', d)):
-            if os.path.isdir(src):
-                os.makedirs(os.path.join(inc, d), exist_ok=True)
-                for f in os.listdir(src):
-                    if not os.path.lexists(os.path.join(inc, d, f)):
-                        os.symlink(os.path.join(src, f), os.path.join(inc, d, f))
-    sdl_cflags = ['-I', inc, '-I', os.path.join(inc, 'SDL2'), '-D_REENTRANT']
-    sdl_libdir = [x[2:] for x in run(['sdl2-config', '--libs']).split() if x.startswith('-L')] or ['/usr/lib/x86_64-linux-gnu']
+    sdl_cflags, sdl_ldflags = linux_dependency_flags(SYSROOT, ZIG_TARGET, OUT)
     cc, cxx = zig_cc(zig), zig_cc(zig, True)
     bid = build_id()
     jobs = []
@@ -376,7 +445,7 @@ def step_host_linux(zig):
     parallel(jobs)
     objs = [os.path.join(obj, 'm1_%s.o' % n) for n in GAME_SOURCES] + gobjs
     exe = os.path.join(OUT, 'voldorium')
-    run(cxx + ['-o', exe] + objs + ['-L' + d for d in sdl_libdir] +
+    run(cxx + ['-o', exe] + objs + sdl_ldflags +
         ['-lSDL2', '-lGL', '-lm', '-ldl', '-lpthread', '-Wl,--build-id=none', '-Wl,--allow-shlib-undefined', '-s'])
     say('  built voldorium (build %s) in %d s' % (bid, time.time() - t))
 
@@ -459,7 +528,14 @@ def step_player(player, gdi):
     open(os.path.join(player, 'README.txt'), 'w', encoding='utf-8', newline=EOL).write(readme)
 
 
-def main():
+def positive_jobs(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError('--jobs must be at least 1')
+    return number
+
+
+def argument_parser():
     ap = argparse.ArgumentParser(description='Builds Voldorium from your own disc dump.')
     ap.add_argument('--gdi', help='your SoulCalibur (USA) disc dump, the .gdi file')
     ap.add_argument('--download', action='store_true', help='fetch missing tools into toolchain/')
@@ -470,8 +546,23 @@ def main():
     ap.add_argument('--module-dir', help='where --only module puts sc_game.dll (Linux: sc_game.so) and biosfont.bin')
     ap.add_argument('--release-dir', help='a new folder for --only release (after a full build)')
     ap.add_argument('--out', help='objects and executables (default %%LOCALAPPDATA%%/sc-m1)')
+    ap.add_argument('--target', choices=TARGETS, default=native_target() if LINUX else TARGETS[0],
+                    help='Linux target (default: native architecture, glibc 2.28)')
+    ap.add_argument('--sysroot', help='target SDL2/OpenGL headers and libraries; required for cross host builds')
+    ap.add_argument('--jobs', type=positive_jobs, default=min(os.cpu_count() or 4, 8),
+                    help='maximum concurrent compiler commands (default: up to 8 CPUs)')
+    return ap
+
+
+def main():
+    ap = argument_parser()
     a = ap.parse_args()
-    global OUT
+    global OUT, ZIG_TARGET, SYSROOT, JOBS
+    ZIG_TARGET, SYSROOT, JOBS = a.target, os.path.abspath(a.sysroot) if a.sysroot else None, a.jobs
+    if LINUX and a.target != native_target() and not SYSROOT and a.only not in ('module', 'player', 'release', 'ggpo'):
+        ap.error('cross-compiling the host executable requires --sysroot')
+    if SYSROOT and not os.path.isdir(SYSROOT):
+        ap.error('--sysroot must be an existing directory')
     if a.out:
         OUT = os.path.abspath(a.out)
     if 'WindowsApps' in sys.executable:
@@ -482,6 +573,8 @@ def main():
             OUT = os.path.join(SC, 'work')
     if sys.platform != 'win32' and not LINUX:
         fail('this builds the Windows and Linux versions; run it on one of them')
+    if LINUX and a.only not in ('player', 'release'):
+        prepare_output(OUT, ZIG_TARGET, SYSROOT)
     t = time.time()
     llvm, sdl, fsca_dir, font = (None,) * 4 if a.only in ('player', 'release') else tool_dirs(a.download, a.only != 'module')
     if a.only == 'module':   # the first run of a released Voldorium (m1/module.c): the game from the player's disc

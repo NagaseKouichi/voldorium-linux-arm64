@@ -5,6 +5,7 @@
 !/.gitignore
 !/.gitattributes
 !/README.md
+!/README-CN.md
 !/NOTICE.md
 !/CHANGELOG.md
 !/.recomp.json

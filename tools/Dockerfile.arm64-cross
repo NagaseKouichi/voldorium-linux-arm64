@@ -1,0 +1,11 @@
+# Reproducible tool choice: Zig is pinned and verified by tools/build.py.
+# Apt dependency versions are recorded by dpkg-query for each local build.
+FROM ubuntu:24.04
+USER root
+COPY ubuntu-cross.sources /etc/apt/sources.list.d/ubuntu.sources
+RUN dpkg --add-architecture arm64 && apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates python3 gcc g++ binutils-aarch64-linux-gnu qemu-user \
+      libsdl2-dev:arm64 libgl-dev:arm64 libgl1-mesa-dri:arm64 libglx-mesa0:arm64 \
+      xvfb xauth pkg-config && rm -rf /var/lib/apt/lists/*
+WORKDIR /src

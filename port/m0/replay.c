@@ -221,14 +221,14 @@ int main(int argc, char **argv)
 			alarm(2);
 			sh4_set_host_fpmode(c.fpscr);
 			fp(&c);
-			_mm_setcsr(0x1f80);
+			sh4_set_host_fpmode(0);
 			alarm(0);
 			ok = compare(&c, out);
 		}
 		else
 		{
 			alarm(0);
-			_mm_setcsr(0x1f80);
+			sh4_set_host_fpmode(0);
 		}
 		if (ok) pass++; else fail++;
 		fprintf(res, "%08x\t%s\t%s\n", fn, ok ? "pass" : "FAIL", ok ? "" : why);
